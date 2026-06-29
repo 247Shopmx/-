@@ -2,8 +2,8 @@ name: Trading Bot
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5' # 14:00 UTC, Lunes a Viernes
-  workflow_dispatch:
+    - cron: '0 14 * * 1-5' # Ejecuta a las 14:00 UTC
+  workflow_dispatch: # Permite ejecutarlo manualmente desde el botón "Run workflow"
 
 jobs:
   run-bot:
@@ -18,8 +18,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run Bot
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python trading_bot.py
