@@ -1,90 +1,140 @@
 import os
+import logging
 import requests
 import pandas as pd
 import yfinance as yf
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
-# 1. Configuración de variables de entorno para Telegram
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# Configuración de Logging para tener un registro exacto en GitHub Actions
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def enviar_alerta_telegram(mensaje):
-    """Envía un mensaje de texto a través del bot de Telegram."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Error: Credenciales de Telegram no encontradas en las variables de entorno.")
-        return
+class TradingBotProfesional:
+    def __init__(self):
+        """Inicializa las conexiones a las APIs y valida credenciales."""
+        # Credenciales de Alpaca (Broker)
+        self.api_key = os.getenv('ALPACA_API_KEY')
+        self.api_secret = os.getenv('ALPACA_SECRET_KEY')
+        
+        # Credenciales de Telegram
+        self.telegram_token = os.getenv('TELEGRAM_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": mensaje,
-        "parse_mode": "Markdown"
-    }
-    
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        print("✅ Alerta enviada a Telegram con éxito.")
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error al enviar el mensaje de Telegram: {e}")
+        self.validar_credenciales()
 
-def calcular_rsi(data, periodos=14):
-    """Calcula el Índice de Fuerza Relativa (RSI)."""
-    delta = data['Close'].diff()
-    ganancia = (delta.where(delta > 0, 0)).rolling(window=periodos).mean()
-    perdida = (-delta.where(delta < 0, 0)).rolling(window=periodos).mean()
-    
-    rs = ganancia / perdida
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+        # Conexión al Broker en modo DEMO (paper=True)
+        try:
+            self.broker = TradingClient(self.api_key, self.api_secret, paper=True)
+            cuenta = self.broker.get_account()
+            logger.info(f"✅ Conectado a Alpaca Demo. Poder de compra: ${cuenta.buying_power}")
+        except Exception as e:
+            logger.error(f"❌ Error crítico al conectar con Alpaca: {e}")
+            self.enviar_telegram("🚨 *ERROR CRÍTICO:* No se pudo conectar al Broker Alpaca.")
+            raise
 
-def analizar_accion(ticker):
-    """Descarga datos, aplica estrategia de EMA/RSI y retorna una señal."""
-    print(f"Analizando {ticker}...")
-    
-    # Descargamos 1 año de datos para tener suficiente histórico para la EMA 200
-    accion = yf.Ticker(ticker)
-    df = accion.history(period="1y")
-    
-    if df.empty:
-        return f"⚠️ {ticker}: No se pudieron obtener datos."
+    def validar_credenciales(self):
+        """Verifica que todos los secretos de GitHub estén configurados."""
+        if not all([self.api_key, self.api_secret, self.telegram_token, self.telegram_chat_id]):
+            logger.error("Faltan variables de entorno (Secrets). Verifica tu configuración en GitHub.")
+            raise ValueError("Credenciales incompletas.")
 
-    # 2. Cálculo de Indicadores
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    df['RSI'] = calcular_rsi(df)
+    def enviar_telegram(self, mensaje):
+        """Envía notificaciones al chat de Telegram de forma segura."""
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        payload = {
+            "chat_id": self.telegram_chat_id,
+            "text": mensaje,
+            "parse_mode": "Markdown"
+        }
+        try:
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Fallo al enviar mensaje de Telegram: {e}")
 
-    # Obtenemos los valores del último día de cotización
-    ultimo_cierre = df.iloc[-1]['Close']
-    ema_50_actual = df.iloc[-1]['EMA_50']
-    ema_200_actual = df.iloc[-1]['EMA_200']
-    rsi_actual = df.iloc[-1]['RSI']
+    def calcular_rsi(self, data, periodos=14):
+        """Cálculo matemático del Índice de Fuerza Relativa (RSI)."""
+        delta = data['Close'].diff()
+        ganancia = (delta.where(delta > 0, 0)).rolling(window=periodos).mean()
+        perdida = (-delta.where(delta < 0, 0)).rolling(window=periodos).mean()
+        rs = ganancia / perdida
+        return 100 - (100 / (1 + rs))
 
-    # 3. Lógica de la Estrategia (Cruces y Sobrecompra/Sobreventa)
-    senal = f"⚪ **MANTENER** en {ticker}\nPrecio: ${ultimo_cierre:.2f} | RSI: {rsi_actual:.1f}"
+    def ejecutar_orden(self, ticker, cantidad, lado):
+        """Envía la orden de compra/venta al mercado de Alpaca."""
+        try:
+            orden = MarketOrderRequest(
+                symbol=ticker,
+                qty=cantidad,
+                side=lado,
+                time_in_force=TimeInForce.GTC
+            )
+            resultado = self.broker.submit_order(orden)
+            
+            accion = "COMPRA" if lado == OrderSide.BUY else "VENTA"
+            mensaje = f"✅ *ORDEN EJECUTADA EN DEMO*\nAcción: {accion} {cantidad} x {ticker}\nID: `{resultado.id}`"
+            logger.info(f"Orden ejecutada: {accion} {ticker}")
+            self.enviar_telegram(mensaje)
+            
+        except Exception as e:
+            error_msg = f"❌ *Fallo al ejecutar orden en {ticker}*\nDetalle: {e}"
+            logger.error(error_msg)
+            self.enviar_telegram(error_msg)
 
-    # Condición de COMPRA: Tendencia general alcista (EMA50 > EMA200) + Retroceso/Sobreventa (RSI < 30)
-    if (ema_50_actual > ema_200_actual) and (rsi_actual < 30):
-        senal = f"🟢 **SEÑAL DE COMPRA** en {ticker}\nPrecio: ${ultimo_cierre:.2f}\nRSI: {rsi_actual:.1f} (Sobreventa)\nTendencia: Alcista (EMA50 > EMA200)"
-    
-    # Condición de VENTA: Tendencia general bajista (EMA50 < EMA200) + Rebote/Sobrecompra (RSI > 70)
-    elif (ema_50_actual < ema_200_actual) and (rsi_actual > 70):
-        senal = f"🔴 **SEÑAL DE VENTA** en {ticker}\nPrecio: ${ultimo_cierre:.2f}\nRSI: {rsi_actual:.1f} (Sobrecompra)\nTendencia: Bajista (EMA50 < EMA200)"
+    def analizar_y_operar(self, tickers):
+        """Descarga datos, calcula estrategia y decide si operar."""
+        logger.info(f"Iniciando análisis de {len(tickers)} activos...")
+        resumen_diario = ["📊 *Resumen del Análisis de Mercado* 📊\n"]
 
-    return senal
+        for ticker in tickers:
+            try:
+                # 1. Obtener datos históricos
+                df = yf.Ticker(ticker).history(period="1y")
+                if df.empty:
+                    logger.warning(f"Sin datos para {ticker}")
+                    continue
 
-def main():
-    # Puedes modificar esta lista con los símbolos que quieras monitorear (Ej. SPY, META, TSLA)
-    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN"]
-    mensajes_alerta = ["📊 **Reporte Diario de Trading Bot** 📊\n"]
+                # 2. Calcular Indicadores (EMA 50, EMA 200, RSI)
+                df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+                df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+                df['RSI'] = self.calcular_rsi(df)
 
-    for ticker in tickers:
-        resultado = analizar_accion(ticker)
-        mensajes_alerta.append(resultado)
+                ultimo_precio = df.iloc[-1]['Close']
+                ema_50 = df.iloc[-1]['EMA_50']
+                ema_200 = df.iloc[-1]['EMA_200']
+                rsi = df.iloc[-1]['RSI']
 
-    # 4. Formatear y enviar el mensaje final
-    mensaje_final = "\n\n".join(mensajes_alerta)
-    print("\n" + mensaje_final)
-    enviar_alerta_telegram(mensaje_final)
+                # 3. Evaluar Estrategia y Operar
+                # COMPRA: Tendencia alcista y RSI sobrevendido
+                if (ema_50 > ema_200) and (rsi < 30):
+                    resumen_diario.append(f"🟢 *{ticker}*: SEÑAL DE COMPRA detectada (${ultimo_precio:.2f})")
+                    self.ejecutar_orden(ticker, cantidad=1, lado=OrderSide.BUY)
+                
+                # VENTA: Tendencia bajista y RSI sobrecomprado
+                elif (ema_50 < ema_200) and (rsi > 70):
+                    resumen_diario.append(f"🔴 *{ticker}*: SEÑAL DE VENTA detectada (${ultimo_precio:.2f})")
+                    self.ejecutar_orden(ticker, cantidad=1, lado=OrderSide.SELL)
+                
+                # MANTENER: Sin condiciones claras
+                else:
+                    resumen_diario.append(f"⚪ *{ticker}*: Mantener (RSI: {rsi:.1f})")
+
+            except Exception as e:
+                logger.error(f"Error analizando {ticker}: {e}")
+
+        # Enviar resumen final al terminar el bucle
+        mensaje_final = "\n".join(resumen_diario)
+        self.enviar_telegram(mensaje_final)
+        logger.info("Análisis finalizado con éxito.")
 
 if __name__ == "__main__":
-    main()
+    # Activos a operar (Puedes añadir los que soporte Alpaca)
+    activos = ["AAPL", "MSFT", "GOOGL", "AMZN"]
+    
+    bot = TradingBotProfesional()
+    bot.analizar_y_operar(activos)
