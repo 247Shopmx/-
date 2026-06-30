@@ -1,28 +1,87 @@
-#include <Trade\Trade.mqh> // Librería estándar de MT5
-#include "Include/Estrategia.mqh"
-#include "Include/GestionOrdenes.mqh"
+#include <Trade\Trade.mqh>
 
-CTrade trade; // Objeto de operaciones
+CTrade trade;
 
-int OnInit() {
-    Print("Bot inicializado correctamente.");
-    return(INIT_SUCCEEDED);
+// ---------- INPUTS ----------
+input double RiskPercent = 1.0;     // riesgo por trade %
+input int RSI_Period = 14;
+input int EMA_Fast = 50;
+input int EMA_Slow = 200;
+
+// ---------- INDICADORES ----------
+double GetEMA(int period, int shift)
+{
+    return iMA(_Symbol, _Period, period, 0, MODE_EMA, PRICE_CLOSE, shift);
 }
 
-void OnTick() {
-    // 1. Obtener datos técnicos
-    double rsi = CalcularRSI(_Symbol, _Period, 14);
-    double ema50 = CalcularEMA(_Symbol, _Period, 50);
-    double ema200 = CalcularEMA(_Symbol, _Period, 200);
+double GetRSI(int period, int shift)
+{
+    return iRSI(_Symbol, _Period, period, PRICE_CLOSE, shift);
+}
 
-    // 2. Lógica de Trading
-    if(ema50 > ema200 && rsi < 30) {
-        Print("Señal de COMPRA detectada.");
-        // Ejecutar compra de 0.1 lotes
-        trade.Buy(0.1, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), 0, 0, "Compra Robot");
+// ---------- RISK MANAGEMENT ----------
+double CalculateLot(double stopLossPoints)
+{
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double risk = balance * (RiskPercent / 100.0);
+
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+    double lot = risk / (stopLossPoints * tickValue);
+
+    if(lot < 0.01) lot = 0.01;
+    return NormalizeDouble(lot, 2);
+}
+
+// ---------- CHECK POSITIONS ----------
+bool HasOpenPosition()
+{
+    return PositionSelect(_Symbol);
+}
+
+// ---------- INIT ----------
+int OnInit()
+{
+    Print("EA iniciado correctamente");
+    return INIT_SUCCEEDED;
+}
+
+// ---------- MAIN LOOP ----------
+void OnTick()
+{
+    if(HasOpenPosition())
+        return; // evita sobretrading
+
+    double emaFast = GetEMA(EMA_Fast, 0);
+    double emaSlow = GetEMA(EMA_Slow, 0);
+    double rsi = GetRSI(RSI_Period, 0);
+
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    double atr = iATR(_Symbol, _Period, 14, 0);
+    double stopLoss = atr * 1.5;
+    double takeProfit = atr * 3.0;
+
+    double lot = CalculateLot(stopLoss / _Point);
+
+    // ---------- BUY ----------
+    if(emaFast > emaSlow && rsi < 30)
+    {
+        double sl = ask - stopLoss;
+        double tp = ask + takeProfit;
+
+        trade.Buy(lot, _Symbol, ask, sl, tp, "BUY EMA+RSI");
+        Print("BUY ejecutado");
     }
-    else if(ema50 < ema200 && rsi > 70) {
-        Print("Señal de VENTA detectada.");
-        trade.Sell(0.1, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), 0, 0, "Venta Robot");
+
+    // ---------- SELL ----------
+    else if(emaFast < emaSlow && rsi > 70)
+    {
+        double sl = bid + stopLoss;
+        double tp = bid - takeProfit;
+
+        trade.Sell(lot, _Symbol, bid, sl, tp, "SELL EMA+RSI");
+        Print("SELL ejecutado");
     }
 }
