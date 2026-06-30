@@ -1,41 +1,116 @@
-import yfinance as yf
-from backtesting import Backtest, Strategy
-from backtesting.lib import crossover
 import os
-import requests
+import logging
+import numpy as np
+import yfinance as yf
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
-# 1. Definimos la estrategia idéntica a la real
-class EmaRsiStrategy(Strategy):
-    def init(self):
-        # Indicadores
-        self.ema50 = self.I(lambda x: x.ewm(span=50, adjust=False).mean(), self.data.Close)
-        self.ema200 = self.I(lambda x: x.ewm(span=200, adjust=False).mean(), self.data.Close)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    def next(self):
-        # Reglas de entrada
-        if self.ema50 > self.ema200 and self.data.Close < self.ema50:
-            if not self.position: self.buy()
-        elif self.ema50 < self.ema200 and self.data.Close > self.ema50:
-            if self.position: self.position.close()
 
-# 2. Descargar datos
-ticker = "AAPL"
-data = yf.Ticker(ticker).history(period="1y")
+class TradingBot:
 
-# 3. Correr Backtest
-bt = Backtest(data, EmaRsiStrategy, cash=10000, commission=.002)
-stats = bt.run()
+    def __init__(self):
+        self.api_key = os.getenv("ALPACA_KEY")
+        self.api_secret = os.getenv("ALPACA_SECRET")
 
-# 4. Enviar resultado a Telegram
-def enviar_reporte(stats):
-    token = os.getenv('TELEGRAM_TOKEN')
-    chat_id = os.getenv('TELEGRAM_CHAT_ID')
-    mensaje = f"📊 *Reporte de Backtesting - {ticker}*\n"
-    mensaje += f"💰 Retorno Final: {stats['Return [%]']:.2f}%\n"
-    mensaje += f"📈 Max Drawdown: {stats['Max. Drawdown [%]']:.2f}%\n"
-    mensaje += f"✅ Win Rate: {stats['Win Rate [%]']:.2f}%\n"
-    
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"})
+        self.client = TradingClient(
+            self.api_key,
+            self.api_secret,
+            paper=True
+        )
 
-enviar_reporte(stats)
+        self.max_risk_per_trade = 0.01  # 1%
+
+    # ---------- DATA ----------
+    def get_data(self, ticker):
+        df = yf.download(ticker, period="3mo", interval="1d")
+        if df.empty:
+            return None
+
+        # TRUE ATR
+        high_low = df["High"] - df["Low"]
+        high_close = np.abs(df["High"] - df["Close"].shift())
+        low_close = np.abs(df["Low"] - df["Close"].shift())
+
+        tr = np.maximum(high_low, np.maximum(high_close, low_close))
+        df["ATR"] = tr.rolling(14).mean()
+
+        df["EMA50"] = df["Close"].ewm(span=50).mean()
+        df["EMA200"] = df["Close"].ewm(span=200).mean()
+
+        return df.iloc[-1]
+
+    # ---------- POSITION SIZING ----------
+    def position_size(self, price, atr):
+        risk_dollars = 10000 * self.max_risk_per_trade
+        stop_distance = atr * 1.5
+
+        if stop_distance == 0:
+            return 0
+
+        qty = risk_dollars / stop_distance
+        return max(1, int(qty))
+
+    # ---------- EXECUTION ----------
+    def execute_trade(self, ticker, side, price, atr):
+
+        qty = self.position_size(price, atr)
+
+        if qty <= 0:
+            return
+
+        sl = price - atr * 1.5 if side == OrderSide.BUY else price + atr * 1.5
+        tp = price + atr * 3.0 if side == OrderSide.BUY else price - atr * 3.0
+
+        try:
+            order = MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY
+            )
+
+            self.client.submit_order(order)
+
+            logger.info(
+                f"TRADE {side.name} {ticker} | qty={qty} | SL={sl:.2f} | TP={tp:.2f}"
+            )
+
+        except Exception as e:
+            logger.error(f"Order error: {e}")
+
+    # ---------- STRATEGY ----------
+    def signal(self, row):
+
+        if row is None:
+            return None
+
+        if row["EMA50"] > row["EMA200"] and row["Close"] < row["EMA50"]:
+            return OrderSide.BUY
+
+        if row["EMA50"] < row["EMA200"] and row["Close"] > row["EMA50"]:
+            return OrderSide.SELL
+
+        return None
+
+    # ---------- RUN ----------
+    def run(self, tickers):
+
+        for t in tickers:
+            data = self.get_data(t)
+
+            if data is None:
+                continue
+
+            side = self.signal(data)
+
+            if side:
+                self.execute_trade(t, side, data["Close"], data["ATR"])
+
+
+if __name__ == "__main__":
+    bot = TradingBot()
+    bot.run(["AAPL", "TSLA", "NVDA"])
